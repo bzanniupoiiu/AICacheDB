@@ -1,0 +1,20 @@
+/home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/xdp/.output/bpftool/bootstrap/main.o: \
+ main.c \
+ /home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/libbpf-bootstrap/bpftool/include/uapi/linux/bpf.h \
+ /home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/libbpf-bootstrap/bpftool/include/linux/types.h \
+ /home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/libbpf-bootstrap/bpftool/include/uapi/linux/bpf_common.h \
+ /home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/xdp/.output/bpftool/bootstrap/libbpf/include/bpf/bpf.h \
+ /home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/xdp/.output/bpftool/bootstrap/libbpf/include/bpf/libbpf_common.h \
+ /home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/xdp/.output/bpftool/bootstrap/libbpf/include/bpf/libbpf_version.h \
+ /home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/xdp/.output/bpftool/bootstrap/libbpf/include/bpf/libbpf_legacy.h \
+ /home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/xdp/.output/bpftool/bootstrap/libbpf/include/bpf/btf.h \
+ /home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/libbpf-bootstrap/bpftool/include/uapi/linux/btf.h \
+ /home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/xdp/.output/bpftool/bootstrap/libbpf/include/bpf/hashmap.h \
+ /home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/xdp/.output/bpftool/bootstrap/libbpf/include/bpf/libbpf.h \
+ main.h \
+ /home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/libbpf-bootstrap/bpftool/include/linux/compiler.h \
+ /home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/libbpf-bootstrap/bpftool/include/linux/compiler_types.h \
+ /home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/libbpf-bootstrap/bpftool/include/linux/compiler-gcc.h \
+ /home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/libbpf-bootstrap/bpftool/include/linux/kernel.h \
+ /home/raoyipeng/1_Voice_1_24_8680/2601/ai-chat/kvstore/libbpf-bootstrap/bpftool/include/linux/build_bug.h \
+ json_writer.h

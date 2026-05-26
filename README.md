@@ -1,5 +1,4 @@
 
-````markdown
 # AICacheDB
 
 > 面向后端开发工程师 AI 助手的高性能本地语义缓存数据库  

@@ -1,4 +1,4 @@
-// kvs_command.c
+﻿// kvs_command.c
 #include "kvstore.h"
 #include <string.h>
 
@@ -50,7 +50,7 @@ int kvs_get_client_addr(int fd, struct sockaddr_in *addr) {
 
 
 // 复制标志（从节点接收命令时避免循环）
-extern int replicating;
+extern __thread int replicating;
 
 // 命令名称表（内部使用）
 static const char *command[] = {
@@ -64,7 +64,7 @@ static const char *command[] = {
     "REXPIRE", "RTTL", "RSETEX",
     "HEXPIRE", "HTTL", "HSETEX",
     "SKEXPIRE", "SKTTL", "SKSETEX",
-    "VSET", "VGET",
+    "VSET", "VGET", "VSEARCH",
     "PING"
 };
 
@@ -108,21 +108,132 @@ enum {
     KVS_CMD_SKSETEX,
     KVS_CMD_VSET,
     KVS_CMD_VGET,
+    KVS_CMD_VSEARCH,
     KVS_CMD_PING,
     KVS_CMD_COUNT
 };
 
-// 判断是否为写命令（从机只读检查）
-static int is_write_command(int cmd) {
-    return (cmd == KVS_CMD_SET || cmd == KVS_CMD_DEL || cmd == KVS_CMD_MOD ||
-            cmd == KVS_CMD_RSET || cmd == KVS_CMD_RDEL || cmd == KVS_CMD_RMOD ||
-            cmd == KVS_CMD_HSET || cmd == KVS_CMD_HDEL || cmd == KVS_CMD_HMOD ||
-            cmd == KVS_CMD_SKSET || cmd == KVS_CMD_SKDEL || cmd == KVS_CMD_SKMOD ||
-            cmd == KVS_CMD_VSET ||
-            cmd == KVS_CMD_EXPIRE || cmd == KVS_CMD_SETEX ||
-            cmd == KVS_CMD_REXPIRE || cmd == KVS_CMD_RSETEX ||
-            cmd == KVS_CMD_HEXPIRE || cmd == KVS_CMD_HSETEX ||
-            cmd == KVS_CMD_SKEXPIRE || cmd == KVS_CMD_SKSETEX);
+typedef struct {
+    int min_argc;
+    int max_argc;
+    int is_write;
+    int persist_on_success;
+} kvs_cmd_meta_t;
+
+static const kvs_cmd_meta_t command_meta[KVS_CMD_COUNT] = {
+    [KVS_CMD_SET]      = {3, 3, 1, 1},
+    [KVS_CMD_GET]      = {2, 2, 0, 0},
+    [KVS_CMD_DEL]      = {2, 2, 1, 1},
+    [KVS_CMD_MOD]      = {3, 3, 1, 1},
+    [KVS_CMD_EXIST]    = {2, 2, 0, 0},
+    [KVS_CMD_RSET]     = {3, 3, 1, 1},
+    [KVS_CMD_RGET]     = {2, 2, 0, 0},
+    [KVS_CMD_RDEL]     = {2, 2, 1, 1},
+    [KVS_CMD_RMOD]     = {3, 3, 1, 1},
+    [KVS_CMD_REXIST]   = {2, 2, 0, 0},
+    [KVS_CMD_HSET]     = {3, 3, 1, 1},
+    [KVS_CMD_HGET]     = {2, 2, 0, 0},
+    [KVS_CMD_HDEL]     = {2, 2, 1, 1},
+    [KVS_CMD_HMOD]     = {3, 3, 1, 1},
+    [KVS_CMD_HEXIST]   = {2, 2, 0, 0},
+    [KVS_CMD_SKSET]    = {3, 3, 1, 1},
+    [KVS_CMD_SKGET]    = {2, 2, 0, 0},
+    [KVS_CMD_SKDEL]    = {2, 2, 1, 1},
+    [KVS_CMD_SKMOD]    = {3, 3, 1, 1},
+    [KVS_CMD_SKEXIST]  = {2, 2, 0, 0},
+    [KVS_CMD_BGSAVE]   = {1, 1, 0, 0},
+    [KVS_CMD_SYNC]     = {1, 1, 0, 0},
+    [KVS_CMD_FINSYNC]  = {1, 1, 0, 0},
+    [KVS_CMD_EXPIRE]   = {3, 3, 1, 1},
+    [KVS_CMD_TTL]      = {2, 2, 0, 0},
+    [KVS_CMD_SETEX]    = {4, 4, 1, 1},
+    [KVS_CMD_REXPIRE]  = {3, 3, 1, 1},
+    [KVS_CMD_RTTL]     = {2, 2, 0, 0},
+    [KVS_CMD_RSETEX]   = {4, 4, 1, 1},
+    [KVS_CMD_HEXPIRE]  = {3, 3, 1, 1},
+    [KVS_CMD_HTTL]     = {2, 2, 0, 0},
+    [KVS_CMD_HSETEX]   = {4, 4, 1, 1},
+    [KVS_CMD_SKEXPIRE] = {3, 3, 1, 1},
+    [KVS_CMD_SKTTL]    = {2, 2, 0, 0},
+    [KVS_CMD_SKSETEX]  = {4, 4, 1, 1},
+    [KVS_CMD_VSET]     = {5, 5, 1, 1},
+    [KVS_CMD_VGET]     = {2, 4, 0, 0},
+    [KVS_CMD_VSEARCH]  = {5, 5, 0, 0},
+    [KVS_CMD_PING]     = {1, 1, 0, 0},
+};
+
+static int kvs_reply_error(char **out_buf, const char *msg)
+{
+    int len = (int)strlen(msg);
+    *out_buf = kvs_malloc(len + 1);
+    if (!*out_buf) {
+        return -2;
+    }
+    memcpy(*out_buf, msg, (size_t)len + 1);
+    return len;
+}
+
+static int is_write_command(int cmd)
+{
+    return cmd >= 0 && cmd < KVS_CMD_COUNT && command_meta[cmd].is_write;
+}
+
+static int command_argc_ok(int cmd, int argc)
+{
+    if (cmd < 0 || cmd >= KVS_CMD_COUNT) {
+        return 0;
+    }
+    return argc >= command_meta[cmd].min_argc &&
+           argc <= command_meta[cmd].max_argc;
+}
+
+static int command_result_changed_data(int cmd, int ret)
+{
+    if (ret < 0) {
+        return 0;
+    }
+
+    switch (cmd) {
+    case KVS_CMD_SET:
+    case KVS_CMD_RSET:
+    case KVS_CMD_HSET:
+    case KVS_CMD_SKSET:
+    case KVS_CMD_SETEX:
+    case KVS_CMD_RSETEX:
+    case KVS_CMD_HSETEX:
+    case KVS_CMD_SKSETEX:
+    case KVS_CMD_VSET:
+        return 1;
+
+    case KVS_CMD_DEL:
+    case KVS_CMD_RDEL:
+    case KVS_CMD_HDEL:
+    case KVS_CMD_SKDEL:
+    case KVS_CMD_MOD:
+    case KVS_CMD_RMOD:
+    case KVS_CMD_HMOD:
+    case KVS_CMD_SKMOD:
+    case KVS_CMD_EXPIRE:
+    case KVS_CMD_REXPIRE:
+    case KVS_CMD_HEXPIRE:
+    case KVS_CMD_SKEXPIRE:
+        return ret == 0;
+
+    default:
+        return 0;
+    }
+}
+
+static void persist_command_if_changed(int cmd, int ret, const char *raw_msg, int raw_len)
+{
+    if (cmd < 0 || cmd >= KVS_CMD_COUNT ||
+        !command_meta[cmd].persist_on_success ||
+        !command_result_changed_data(cmd, ret) ||
+        !raw_msg || raw_len <= 0) {
+        return;
+    }
+
+    kvs_persistence_append(raw_msg, raw_len);
 }
 
 int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int raw_len, char **out_buf) {
@@ -130,9 +241,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
     *out_buf = NULL;
 
     if (argc < 1) {
-        *out_buf = kvs_malloc(28);
-        if (!*out_buf) return -2;
-        return sprintf(*out_buf, "-ERR wrong number of arguments\r\n");
+        return kvs_reply_error(out_buf, "-ERR wrong number of arguments\r\n");
     }
 
     int cmd = -1;
@@ -150,10 +259,12 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
         return sprintf(*out_buf, "-ERR unknown command '%s'\r\n", argv[0]);
     }
 
-    if (g_config.slave_mode && is_write_command(cmd)) {
-        *out_buf = kvs_malloc(11);
-        if (!*out_buf) return -2;
-        return sprintf(*out_buf, "-READONLY\r\n");
+    if (!command_argc_ok(cmd, argc)) {
+        return kvs_reply_error(out_buf, "-ERR wrong number of arguments\r\n");
+    }
+
+    if (g_config.slave_mode && !replicating && is_write_command(cmd)) {
+        return kvs_reply_error(out_buf, "-READONLY\r\n");
     }
 
     // 统一解析 key 和 value（仅用于普通命令，SETEX 等特殊命令内部会重新获取 value）
@@ -176,7 +287,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, "+OK\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         // check_and_trigger_bgsave();
         break;
 
@@ -211,7 +322,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, ":0\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
 
     case KVS_CMD_MOD:
@@ -229,7 +340,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, "-ERR no such key\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
 
     case KVS_CMD_EXIST:
@@ -258,7 +369,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, "+OK\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
 
     case KVS_CMD_RGET: {
@@ -292,7 +403,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, ":0\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
 
     case KVS_CMD_RMOD:
@@ -310,7 +421,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, "-ERR no such key\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
 
     case KVS_CMD_REXIST:
@@ -339,7 +450,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, "+OK\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
 
     case KVS_CMD_HGET: {
@@ -374,7 +485,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, ":0\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
 
     case KVS_CMD_HMOD:
@@ -392,7 +503,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, "-ERR no such key\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
 
     case KVS_CMD_HEXIST:
@@ -421,7 +532,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, "+OK\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
 
     case KVS_CMD_SKGET: {
@@ -455,7 +566,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, ":0\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
 
     case KVS_CMD_SKMOD:
@@ -473,7 +584,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, "-ERR no such key\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
 
     case KVS_CMD_SKEXIST:
@@ -547,7 +658,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, "+OK\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
     }
 
@@ -574,7 +685,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, "-ERR internal error\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
     }
 
@@ -626,7 +737,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, "+OK\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
     }
 
@@ -653,7 +764,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, "-ERR internal error\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
     }
 
@@ -705,7 +816,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, "+OK\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
     }
 
@@ -732,7 +843,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, "-ERR internal error\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
     }
 
@@ -784,7 +895,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, "+OK\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
     }
 
@@ -811,7 +922,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
             if (!*out_buf) return -2;
             length = sprintf(*out_buf, "-ERR internal error\r\n");
         }
-        kvs_persistence_append(raw_msg, raw_len);
+        persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         break;
     }
 
@@ -879,7 +990,7 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
              * 直接持久化 raw RESP。
              * 后面 AOF 重放时，只要 VSET 已注册，就能恢复。
              */
-            kvs_persistence_append(raw_msg, raw_len);
+            persist_command_if_changed(cmd, ret, raw_msg, raw_len);
         }
 
         break;
@@ -1001,6 +1112,85 @@ int kvs_execute_command(int fd, int argc, char **argv, const char *raw_msg, int 
         *out_buf = kvs_malloc(36);
         if (!*out_buf) return -2;
         length = sprintf(*out_buf, "-ERR wrong number of arguments\r\n");
+        break;
+    }
+
+    case KVS_CMD_VSEARCH: {
+        /*
+         * VSEARCH dim vector topk threshold
+         * 返回：*N，每个元素是 [question, answer, score]
+         */
+        int dim = atoi(argv[1]);
+        char *vector_str = argv[2];
+        int topk = atoi(argv[3]);
+        float threshold = (float)atof(argv[4]);
+        vector_search_result_t *results = NULL;
+        int result_count = 0;
+
+        if (dim <= 0 || topk <= 0) {
+            length = kvs_reply_error(out_buf, "-ERR invalid vector search args\r\n");
+            if (length < 0) return length;
+            break;
+        }
+
+        ret = kvs_vector_search(&global_vector_tree,
+                                dim,
+                                vector_str,
+                                topk,
+                                threshold,
+                                &results,
+                                &result_count);
+        if (ret < 0) {
+            *out_buf = kvs_malloc(34);
+            if (!*out_buf) return -2;
+            length = sprintf(*out_buf, "-ERR vector search failed\r\n");
+            break;
+        }
+
+        length = snprintf(NULL, 0, "*%d\r\n", result_count);
+        for (int i = 0; i < result_count; i++) {
+            char score_buf[64];
+            size_t key_len = strlen(results[i].question);
+            size_t answer_len = strlen(results[i].answer);
+            snprintf(score_buf, sizeof(score_buf), "%.6f", results[i].score);
+            size_t score_len = strlen(score_buf);
+
+            length += snprintf(NULL,
+                               0,
+                               "*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                               key_len,
+                               results[i].question,
+                               answer_len,
+                               results[i].answer,
+                               score_len,
+                               score_buf);
+        }
+
+        *out_buf = kvs_malloc(length + 1);
+        if (!*out_buf) {
+            kvs_vector_search_results_free(results);
+            return -2;
+        }
+
+        int offset = sprintf(*out_buf, "*%d\r\n", result_count);
+        for (int i = 0; i < result_count; i++) {
+            char score_buf[64];
+            size_t key_len = strlen(results[i].question);
+            size_t answer_len = strlen(results[i].answer);
+            snprintf(score_buf, sizeof(score_buf), "%.6f", results[i].score);
+            size_t score_len = strlen(score_buf);
+
+            offset += sprintf(*out_buf + offset,
+                              "*3\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
+                              key_len,
+                              results[i].question,
+                              answer_len,
+                              results[i].answer,
+                              score_len,
+                              score_buf);
+        }
+
+        kvs_vector_search_results_free(results);
         break;
     }
 #endif

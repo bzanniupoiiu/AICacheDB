@@ -30,7 +30,7 @@ extern kvs_vector_t global_vector_tree;
 #endif
 
 //---------------------------------------------------
-int replicating = 0;//是否在复制（全局变量）
+__thread int replicating = 0;//当前线程是否正在应用复制命令
 
 //--------------------------------------------------
 static mp_pool_t g_mempool;   
@@ -168,16 +168,16 @@ int kvs_protocol(int fd, const char *msg, size_t length, char **out_buf) {
 //初始化============================================================
 int init_kvengine(void) {
 		
-	if (kvs_mempool_create(&g_mempool, 256 * 1024 * 1024) != 0) {//256MB
-		return -1;
-	}
+	// if (kvs_mempool_create(&g_mempool, 256 * 1024 * 1024) != 0) {//256MB
+	// 	return -1;
+	// }
 
 	#if ENABLE_ARRAY
-    memset(&global_array, 0, sizeof(kvs_array_t));
-    if (kvs_array_create(&global_array) != 0) {
-        fprintf(stderr, "Failed to create array engine\n");
-        return -1;
-    }
+        memset(&global_array, 0, sizeof(kvs_array_t));
+        if (kvs_array_create(&global_array) != 0) {
+            fprintf(stderr, "Failed to create array engine\n");
+            return -1;
+        }
     #endif
 
     #if ENABLE_RBTREE
@@ -213,6 +213,50 @@ int init_kvengine(void) {
     #endif
 
 	return 0;
+}
+
+int kvs_reset_data_engines(void) {
+#if ENABLE_ARRAY
+    kvs_array_destory(&global_array);
+    memset(&global_array, 0, sizeof(kvs_array_t));
+    if (kvs_array_create(&global_array) != 0) {
+        return -1;
+    }
+#endif
+
+#if ENABLE_RBTREE
+    kvs_rbtree_destory(&global_rbtree);
+    memset(&global_rbtree, 0, sizeof(kvs_rbtree_t));
+    if (kvs_rbtree_create(&global_rbtree) != 0) {
+        return -1;
+    }
+#endif
+
+#if ENABLE_HASH
+    kvs_hash_destory(&global_hash);
+    memset(&global_hash, 0, sizeof(kvs_hash_t));
+    if (kvs_hash_create(&global_hash) != 0) {
+        return -1;
+    }
+#endif
+
+#if ENABLE_SKIPLIST
+    kvs_skiplist_destroy(&global_skiplist);
+    memset(&global_skiplist, 0, sizeof(kvs_skiplist_t));
+    if (kvs_skiplist_create(&global_skiplist) != 0) {
+        return -1;
+    }
+#endif
+
+#if ENABLE_VECTOR
+    kvs_vector_destroy(&global_vector_tree);
+    memset(&global_vector_tree, 0, sizeof(kvs_vector_t));
+    if (kvs_vector_create(&global_vector_tree) != 0) {
+        return -1;
+    }
+#endif
+
+    return 0;
 }
 
 void dest_kvengine(void) {
@@ -290,8 +334,7 @@ int main(int argc, char *argv[]) {
             dest_kvengine();
             return -1;
         }
-    printf("[slave] KVStore is listening on port: %d!!!\n", g_config.ports[0]);
-
+        printf("[slave] KVStore is listening on port: %d!!!\n", g_config.ports[0]);
     } else {//如果是主机模式
         if (kvs_replication_master_init() != 0) {
             fprintf(stderr, "Failed to init master replication\n");

@@ -10,11 +10,31 @@ kvs_config_t g_config;
 
 
 static void trim(char *str) {
-    char *start = str;
-    while (isspace(*start)) start++;
-    char *end = start + strlen(start) - 1;
-    while (end > start && isspace(*end)) *end-- = '\0';
-    if (start != str) memmove(str, start, strlen(start) + 1);
+    char *start;
+    char *end;
+
+    if (!str) {
+        return;
+    }
+
+    start = str;
+    while (*start && isspace((unsigned char)*start)) {
+        start++;
+    }
+
+    if (*start == '\0') {
+        str[0] = '\0';
+        return;
+    }
+
+    end = start + strlen(start) - 1;
+    while (end > start && isspace((unsigned char)*end)) {
+        *end-- = '\0';
+    }
+
+    if (start != str) {
+        memmove(str, start, strlen(start) + 1);
+    }
 }
 
 
@@ -47,13 +67,18 @@ int load_config(const char *filename)
 
         if(strcmp(key,"bind") == 0)
         {
-            strncpy(g_config.bind_ip, value, sizeof(g_config.bind_ip)-1);
+            snprintf(g_config.bind_ip, sizeof(g_config.bind_ip), "%s", value);
         }
         else if (strcmp(key, "port") == 0) {
             // 仅支持单端口
             trim(value);
             g_config.port_count = 1;
-            g_config.ports[0] = atoi(value);
+            int port = atoi(value);
+            if (port > 0 && port <= 65535) {
+                g_config.ports[0] = port;
+            } else {
+                printf("Warning: Invalid port: '%s'\n", value);
+            }
         }
         else if (strcmp(key, "appendonly") == 0) {
             g_config.appendonly = (strcmp(value, "yes") == 0 || strcmp(value, "true") == 0);
@@ -64,12 +89,15 @@ int load_config(const char *filename)
             else if (strcmp(value, "always") == 0) g_config.appendfsync = 2;
         }
         else if (strcmp(key, "slaveof") == 0) {
-            char host[64];
-            int port;
-            if (sscanf(value, "%s %d", host, &port) == 2) {
+            char host[64] = {0};
+            int port = 0;
+            if (sscanf(value, "%63s %d", host, &port) == 2 &&
+                port > 0 && port <= 65535) {
                 g_config.slave_mode = 1;
-                strcpy(g_config.master_host, host);
+                snprintf(g_config.master_host, sizeof(g_config.master_host), "%s", host);
                 g_config.master_port = port;
+            } else {
+                printf("Warning: Invalid slaveof: '%s'\n", value);
             }
         }
         

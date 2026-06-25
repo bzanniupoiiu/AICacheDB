@@ -1,54 +1,59 @@
-// #define _GNU_SOURCE
-// #include <fcntl.h>
+#define _GNU_SOURCE
 #include "kvstore.h"
 #include <sys/stat.h>
 #include <unistd.h>
-#include <time.h>
 #include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/mman.h>
 #include <liburing.h>
 #include <pthread.h>
 #include <errno.h>
 #include <fcntl.h>
-
+#include <stdint.h>
+#include <stdlib.h>
 #include <stdatomic.h>
+// 提供 C11 原子操作。
+// 这里用于 AOF 环形队列的 write_idx、read_idx、io_error 等变量
 
-#define MAX_BATCH 2048   
+#define AOF_URING_ENTRIES 8192  //iouring的总槽位
+#define AOF_IO_DEPTH 64         //同时飞行的请求数,也就是最多允许 64 个 AOF 写请求同时提交给内核但尚未完成。
+#define AOF_BATCH_BUF (1 << 20) //每次批量写最大的buffer（1MB）,后台线程会把多个 AOF 命令合并到这个 buffer 里，减少写系统调用次数。
+#define AOF_CQE_BATCH 128       //每次批量收割多少完成事件
+#define AOF_IDLE_US 100         //后台线程没事的时候睡多久,AOF 后台线程空闲时 sleep 的时间，单位是微秒。
+#define AOF_SQPOLL_IDLE_MS 1000 //内核 SQPOLL 线程没事时多久睡眠,SQPOLL 可以减少系统调用开销，但会多占用内核线程资源。
 
-
-
-
-// ---------- io_uring 相关（仅 no 模式使用）----------
-static struct io_uring g_uring;
+// ---------- io_uring  ----------
+static struct io_uring g_uring; //iouring
 static int g_aof_fd = -1;
 static off_t g_aof_offset = 0;
+static int g_uring_enabled = 0;
 
-// ---------- always 模式的 FILE* ----------
+// ---------- always 模式?FILE* ----------
 static FILE *aof_fp = NULL;
 
 // ---------- 加载标志 ----------
 static int loading_aof = 0;
 
+typedef struct aof_write_req {
+    char *buf;
+    size_t cap;
+    size_t len;
+    size_t written;
+    off_t file_off;
+    int in_use;
+} aof_write_req_t;
 
 
-
-// 无锁环形缓冲区结构（SPSC）
 typedef struct aof_ring {
-    char **slots;                   // 指向命令数据的指针数组
-    size_t *lens;                   // 每条命令的长度
+    char **slots;
+    size_t *lens;
     size_t capacity;
-    atomic_size_t write_idx;        // 生产者写位置
-    atomic_size_t read_idx;         // 消费者读位置
-
+    atomic_size_t write_idx;
+    atomic_size_t read_idx;
     int stop;
     pthread_t thread;
-    int sync_mode;                  // 0: no (io_uring), 2: always (同步写)
-
-    // 添加批量控制字段
-    int batch_threshold;
-    int timeout_us;
+    int sync_mode;
+    atomic_int io_error;
 } aof_ring_t;
+
 
 static aof_ring_t g_aof_ring = {0};
 
@@ -81,11 +86,12 @@ enum {
     TYPE_VECTOR = 5
 };
 
-static int persistence_mode = 2;  // 0:无, 1:RDB, 2:AOF
+static int persistence_mode = 2;  // 0:�? 1:RDB, 2:AOF
 
 // ---------- RDB 相关函数----------
-//红黑树
-static void rdb_write_kv_pair(FILE *fp, int type, const char *key, const char *value, long long expire_ms) {
+//红黑
+static void rdb_write_kv_pair(FILE *fp, int type, const char *key, const char *value, long long expire_ms) 
+{
     int keylen = strlen(key);
     int valuelen = strlen(value);
     fwrite(&type, sizeof(char), 1, fp);
@@ -96,13 +102,14 @@ static void rdb_write_kv_pair(FILE *fp, int type, const char *key, const char *v
     fwrite(value, 1, valuelen, fp);
 }
 
-static void rdb_save_rbtree_node(rbtree_node *node, FILE *fp, int type) {
+static void rdb_save_rbtree_node(rbtree_node *node, FILE *fp, int type)
+{
     if (node == global_rbtree.nil) return;
     rdb_save_rbtree_node(node->left, fp, type);
     rdb_write_kv_pair(fp, type, node->key, node->value, node->expire_ms);
     rdb_save_rbtree_node(node->right, fp, type);
 }
-//vector ，和红黑树不同
+//vector
 #if ENABLE_VECTOR
 static void rdb_write_vector_entry(FILE *fp, const char* question, const char *answer, int dim, const char *vector_str)
 {
@@ -132,10 +139,6 @@ static char *rdb_vector_to_string(float *vec, int dim) {
         return NULL;
     }
 
-    /*
-     * 每个 float 预留 32 字节基本够用：
-     * 例如 -123.456789,
-     */
     size_t cap = (size_t)dim * 32 + 1;
     char *buf = (char *)kvs_malloc(cap);
     if (!buf) {
@@ -164,7 +167,7 @@ static char *rdb_vector_to_string(float *vec, int dim) {
 
     return buf;
 }
-
+//中序遍历
 static void rdb_save_vector_node(kvs_vector_t *inst, rbtree_node *node, FILE *fp) {
     if (!inst || !fp || node == inst->tree.nil) {
         return;
@@ -205,6 +208,7 @@ static void rdb_save_vector_node(kvs_vector_t *inst, rbtree_node *node, FILE *fp
      */
     rdb_save_vector_node(inst, node->right, fp);
 }
+
 
 
 #endif  
@@ -253,48 +257,58 @@ int rdb_save_to_file(const char *filename) {
     return ret;
 }
 
-int rdb_load_files(void) {
-    int fd = open(FULL_RDB_FILE, O_RDONLY);
-    if (fd < 0) return 0;
+int rdb_save_to_memory(char **out_buf, size_t *out_len) {
+    char *buf = NULL;
+    size_t len = 0;
 
-    struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size == 0) {
-        close(fd);
-        return 0;
+    if (!out_buf || !out_len) return -1;
+
+    FILE *fp = open_memstream(&buf, &len);
+    if (!fp) return -1;
+
+    int ret = rdb_save_to_fp(fp);
+    if (fclose(fp) != 0) ret = -1;
+
+    if (ret != 0) {
+        free(buf);
+        return -1;
     }
 
-    char *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
-    close(fd);
-    if (map == MAP_FAILED) return -1;
+    *out_buf = buf;
+    *out_len = len;
+    return 0;
+}
 
-    char *ptr = map, *end = map + st.st_size;
-    char *key_buf = NULL, *val_buf = NULL;
-    size_t key_cap = 0, val_cap = 0;
+int rdb_load_from_memory(const char *data, size_t len) {
+    if (!data || len == 0) return 0;
+
+    const char *ptr = data;
+    const char *end = data + len;
+    char *key_buf = NULL;
+    char *val_buf = NULL;
+    size_t key_cap = 0;
+    size_t val_cap = 0;
 
     while (ptr < end) {
-
-        //先判断是不是Vector
-        if(ptr + 1 > end) break;
+        if (ptr + 1 > end) break;
         char type = *ptr++;
-    #if ENABLE_VECTOR
-        if(type == TYPE_VECTOR)
-        {
+
+#if ENABLE_VECTOR
+        if (type == TYPE_VECTOR) {
             if (ptr + sizeof(int) > end) break;
             int qlen;
             memcpy(&qlen, ptr, sizeof(int));
             ptr += sizeof(int);
-
             if (qlen < 0 || ptr + qlen > end) break;
-            char *q = ptr;
+            const char *q = ptr;
             ptr += qlen;
 
             if (ptr + sizeof(int) > end) break;
             int alen;
             memcpy(&alen, ptr, sizeof(int));
             ptr += sizeof(int);
-
             if (alen < 0 || ptr + alen > end) break;
-            char *a = ptr;
+            const char *a = ptr;
             ptr += alen;
 
             if (ptr + sizeof(int) > end) break;
@@ -306,15 +320,13 @@ int rdb_load_files(void) {
             int vlen;
             memcpy(&vlen, ptr, sizeof(int));
             ptr += sizeof(int);
-
             if (vlen < 0 || ptr + vlen > end) break;
-            char *v = ptr;
+            const char *v = ptr;
             ptr += vlen;
 
-            char *qbuf = (char *)kvs_malloc(qlen + 1);
-            char *abuf = (char *)kvs_malloc(alen + 1);
-            char *vbuf = (char *)kvs_malloc(vlen + 1);
-
+            char *qbuf = (char *)kvs_malloc((size_t)qlen + 1);
+            char *abuf = (char *)kvs_malloc((size_t)alen + 1);
+            char *vbuf = (char *)kvs_malloc((size_t)vlen + 1);
             if (!qbuf || !abuf || !vbuf) {
                 if (qbuf) kvs_free(qbuf);
                 if (abuf) kvs_free(abuf);
@@ -322,25 +334,25 @@ int rdb_load_files(void) {
                 break;
             }
 
-            memcpy(qbuf, q, qlen);
+            memcpy(qbuf, q, (size_t)qlen);
             qbuf[qlen] = '\0';
-            memcpy(abuf, a, alen);
+            memcpy(abuf, a, (size_t)alen);
             abuf[alen] = '\0';
-            memcpy(vbuf, v, vlen);
+            memcpy(vbuf, v, (size_t)vlen);
             vbuf[vlen] = '\0';
 
             if (dim > 0) {
                 kvs_vector_set(&global_vector_tree, qbuf, abuf, dim, vbuf);
             }
+
             kvs_free(qbuf);
             kvs_free(abuf);
             kvs_free(vbuf);
             continue;
         }
-    #endif
+#endif
 
-        if (ptr + 1 + sizeof(long long) > end) break;
-        // char type = *ptr++;
+        if (ptr + sizeof(long long) > end) break;
         long long expire_ms;
         memcpy(&expire_ms, ptr, sizeof(long long));
         ptr += sizeof(long long);
@@ -350,7 +362,7 @@ int rdb_load_files(void) {
         memcpy(&keylen, ptr, sizeof(int));
         ptr += sizeof(int);
         if (keylen < 0 || ptr + keylen > end) break;
-        char *key = ptr;
+        const char *key = ptr;
         ptr += keylen;
 
         if (ptr + sizeof(int) > end) break;
@@ -358,24 +370,25 @@ int rdb_load_files(void) {
         memcpy(&valuelen, ptr, sizeof(int));
         ptr += sizeof(int);
         if (valuelen < 0 || ptr + valuelen > end) break;
-        char *value = ptr;
+        const char *value = ptr;
         ptr += valuelen;
 
-        if (keylen + 1 > key_cap) {
+        if ((size_t)keylen + 1 > key_cap) {
             if (key_buf) kvs_free(key_buf);
-            key_buf = kvs_malloc(keylen + 1);
+            key_buf = (char *)kvs_malloc((size_t)keylen + 1);
             if (!key_buf) break;
-            key_cap = keylen + 1;
+            key_cap = (size_t)keylen + 1;
         }
-        if (valuelen + 1 > val_cap) {
+        if ((size_t)valuelen + 1 > val_cap) {
             if (val_buf) kvs_free(val_buf);
-            val_buf = kvs_malloc(valuelen + 1);
+            val_buf = (char *)kvs_malloc((size_t)valuelen + 1);
             if (!val_buf) break;
-            val_cap = valuelen + 1;
+            val_cap = (size_t)valuelen + 1;
         }
-        memcpy(key_buf, key, keylen);
+
+        memcpy(key_buf, key, (size_t)keylen);
         key_buf[keylen] = '\0';
-        memcpy(val_buf, value, valuelen);
+        memcpy(val_buf, value, (size_t)valuelen);
         val_buf[valuelen] = '\0';
 
         switch (type) {
@@ -407,32 +420,213 @@ int rdb_load_files(void) {
 
     if (key_buf) kvs_free(key_buf);
     if (val_buf) kvs_free(val_buf);
-    munmap(map, st.st_size);
     return 0;
 }
 
 
+int rdb_load_files(void) {
+    FILE *fp = fopen(FULL_RDB_FILE, "rb");
+    if (!fp) return 0;
 
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return -1;
+    }
 
-// ---------- AOF 后台工作线程（统一处理 always 和 no 模式）----------
+    long file_size = ftell(fp);
+    if (file_size <= 0) {
+        fclose(fp);
+        return 0;
+    }
+    rewind(fp);
+
+    char *buf = (char *)malloc((size_t)file_size);
+    if (!buf) {
+        fclose(fp);
+        return -1;
+    }
+
+    size_t nread = fread(buf, 1, (size_t)file_size, fp);
+    fclose(fp);
+    if (nread != (size_t)file_size) {
+        free(buf);
+        return -1;
+    }
+
+    if (kvs_reset_data_engines() != 0) {
+        free(buf);
+        return -1;
+    }
+
+    int ret = rdb_load_from_memory(buf, (size_t)file_size);
+    free(buf);
+    return ret;
+}
+// ---------- AOF ----------
+static int aof_reap_completions(struct io_uring *uring,
+                                aof_write_req_t *reqs,
+                                int *inflight,
+                                int wait_one) {
+    struct io_uring_cqe *cqes[AOF_CQE_BATCH];
+    int total = 0;
+    int resubmitted = 0;
+
+    if (wait_one && *inflight > 0) {
+        struct io_uring_cqe *cqe = NULL;
+        int ret = io_uring_wait_cqe(uring, &cqe);
+        if (ret < 0) {
+            fprintf(stderr, "AOF io_uring_wait_cqe failed: %s\n", strerror(-ret));
+            atomic_store(&g_aof_ring.io_error, 1);
+            return ret;
+        }
+    }
+
+    while (1) {
+        int n = io_uring_peek_batch_cqe(uring, cqes, AOF_CQE_BATCH);
+        if (n <= 0) break;
+
+        for (int i = 0; i < n; i++) {
+            struct io_uring_cqe *cqe = cqes[i];
+            aof_write_req_t *req = (aof_write_req_t *)(uintptr_t)cqe->user_data;
+
+            if (!req || !req->in_use) continue;
+
+            if (cqe->res < 0) {
+                fprintf(stderr, "AOF async write failed: %s\n", strerror(-cqe->res));
+                atomic_store(&g_aof_ring.io_error, 1);
+                req->in_use = 0;
+                (*inflight)--;
+                continue;
+            }
+            if (cqe->res == 0 && req->written < req->len) {
+                fprintf(stderr, "AOF async write returned 0 before completion\n");
+                atomic_store(&g_aof_ring.io_error, 1);
+                req->in_use = 0;
+                (*inflight)--;
+                continue;
+            }
+
+            req->written += (size_t)cqe->res;
+            if (req->written < req->len) {
+                struct io_uring_sqe *sqe = io_uring_get_sqe(uring);
+                if (!sqe) {
+                    int ret = io_uring_submit(uring);
+                    if (ret < 0) {
+                        fprintf(stderr, "AOF submit before retry failed: %s\n", strerror(-ret));
+                        atomic_store(&g_aof_ring.io_error, 1);
+                        req->in_use = 0;
+                        (*inflight)--;
+                        continue;
+                    }
+                    sqe = io_uring_get_sqe(uring);
+                }
+                if (!sqe) {
+                    fprintf(stderr, "AOF cannot acquire SQE for retry\n");
+                    atomic_store(&g_aof_ring.io_error, 1);
+                    req->in_use = 0;
+                    (*inflight)--;
+                    continue;
+                }
+
+                io_uring_prep_write(sqe,
+                                    g_aof_fd,
+                                    req->buf + req->written,
+                                    req->len - req->written,
+                                    req->file_off + (off_t)req->written);
+                sqe->user_data = (uint64_t)(uintptr_t)req;
+                resubmitted++;
+            } else {
+                req->in_use = 0;
+                (*inflight)--;
+            }
+        }
+
+        io_uring_cq_advance(uring, (unsigned)n);
+        total += n;
+    }
+
+    if (resubmitted > 0) {
+        int ret = io_uring_submit(uring);
+        if (ret < 0) {
+            fprintf(stderr, "AOF retry submit failed: %s\n", strerror(-ret));
+            atomic_store(&g_aof_ring.io_error, 1);
+            for (int i = 0; i < AOF_IO_DEPTH; i++) reqs[i].in_use = 0;
+            *inflight = 0;
+            return ret;
+        }
+    }
+
+    return total;
+}
+
+static aof_write_req_t *aof_find_free_req(aof_write_req_t *reqs) {
+    for (int i = 0; i < AOF_IO_DEPTH; i++) {
+        if (!reqs[i].in_use) return &reqs[i];
+    }
+    return NULL;
+}
+
+static int aof_fill_batch(aof_ring_t *ring,
+                          aof_write_req_t *req,
+                          size_t *local_read_idx) {
+    size_t write_idx = atomic_load_explicit(&ring->write_idx, memory_order_acquire);
+    size_t batch_len = 0;
+
+    while (*local_read_idx < write_idx) {
+        size_t idx = *local_read_idx % ring->capacity;
+        char *data = ring->slots[idx];
+        size_t len = ring->lens[idx];
+
+        if (!data) {
+            (*local_read_idx)++;
+            continue;
+        }
+
+        if (len > req->cap && batch_len == 0) {
+            char *new_buf = (char *)realloc(req->buf, len);
+            if (!new_buf) {
+                fprintf(stderr, "AOF large command buffer allocation failed: %zu\n", len);
+                atomic_store(&ring->io_error, 1);
+                return -1;
+            }
+            req->buf = new_buf;
+            req->cap = len;
+        }
+
+        if (batch_len > 0 && batch_len + len > req->cap) break;
+
+        memcpy(req->buf + batch_len, data, len);
+        batch_len += len;
+
+        kvs_free(data);
+        ring->slots[idx] = NULL;
+        ring->lens[idx] = 0;
+        (*local_read_idx)++;
+    }
+
+    req->len = batch_len;
+    req->written = 0;
+    return batch_len > 0 ? 1 : 0;
+}
+
 static void *aof_worker(void *arg) {
     aof_ring_t *ring = &g_aof_ring;
 
-    // ---------------- always 模式（不动） ----------------
-    if (ring->sync_mode == 2) {
+    if (ring->sync_mode == 2) {  //fwrite
         aof_fp = fopen(AOF_FILE, "a");
         if (!aof_fp) {
             fprintf(stderr, "AOF always worker: failed to open file\n");
+            atomic_store(&ring->io_error, 1);
             return NULL;
         }
         setbuf(aof_fp, NULL);
 
-        while (!ring->stop) {
-            size_t write_idx = atomic_load(&ring->write_idx);
-            size_t read_idx  = atomic_load(&ring->read_idx);
+        while (!ring->stop || atomic_load_explicit(&ring->read_idx, memory_order_acquire) < atomic_load_explicit(&ring->write_idx, memory_order_acquire)) {
+            size_t read_idx = atomic_load_explicit(&ring->read_idx, memory_order_acquire);
+            size_t write_idx = atomic_load_explicit(&ring->write_idx, memory_order_acquire);
 
             if (write_idx == read_idx) {
-                usleep(100);
+                usleep(AOF_IDLE_US);
                 continue;
             }
 
@@ -441,133 +635,132 @@ static void *aof_worker(void *arg) {
             size_t len = ring->lens[idx];
 
             if (data) {
-                fwrite(data, 1, len, aof_fp);
-                fflush(aof_fp);
-                fsync(fileno(aof_fp));
-
+                if (fwrite(data, 1, len, aof_fp) != len || fflush(aof_fp) != 0 || fsync(fileno(aof_fp)) != 0) {
+                    fprintf(stderr, "AOF always write/fsync failed: %s\n", strerror(errno));
+                    atomic_store(&ring->io_error, 1);
+                }
                 kvs_free(data);
                 ring->slots[idx] = NULL;
+                ring->lens[idx] = 0;
             }
 
-            atomic_store(&ring->read_idx, read_idx + 1);
+            atomic_store_explicit(&ring->read_idx, read_idx + 1, memory_order_release);
         }
 
         if (aof_fp) fclose(aof_fp);
+        aof_fp = NULL;
         return NULL;
     }
 
-    // ---------------- no 模式（重写核心逻辑） ----------------
-    struct io_uring *ring_uring = &g_uring;
+    aof_write_req_t reqs[AOF_IO_DEPTH];//同时飞行的请求数
+    memset(reqs, 0, sizeof(reqs));
 
-    #define AOF_BATCH_BUF (1 << 20)   // 1MB
-
-    char *batch_buf;
-    if (posix_memalign((void **)&batch_buf, 4096, AOF_BATCH_BUF) != 0) {
-        fprintf(stderr, "batch_buf alloc failed\n");
-        return NULL;
+    for (int i = 0; i < AOF_IO_DEPTH; i++) {//分配空间
+        reqs[i].buf = (char *)malloc(AOF_BATCH_BUF);
+        if (!reqs[i].buf) {
+            fprintf(stderr, "AOF batch buffer allocation failed\n");
+            atomic_store(&ring->io_error, 1);
+            for (int j = 0; j < i; j++) free(reqs[j].buf);
+            return NULL;
+        }
+        reqs[i].cap = AOF_BATCH_BUF;
     }
 
-    size_t batch_len = 0;
-    size_t local_read_idx = 0;
+    int inflight = 0;
+    size_t local_read_idx = atomic_load_explicit(&ring->read_idx, memory_order_acquire);
 
-    while (!ring->stop) {
-        size_t write_idx = atomic_load(&ring->write_idx);
+    while (!ring->stop || local_read_idx < atomic_load_explicit(&ring->write_idx, memory_order_acquire) || inflight > 0) { //只要服务没要求停止，或者队列里还有 AOF 数据没取完，或者已经提交的 io_uring 写请求还没完成，后台线程就继续循环。
+        aof_reap_completions(&g_uring, reqs, &inflight, 0);//用于回收CQ，哦，这里面还会判断有没有写完
 
-        if (local_read_idx == 0) {
-            local_read_idx = atomic_load(&ring->read_idx);
+        int submitted_now = 0;
+        while (local_read_idx < atomic_load_explicit(&ring->write_idx, memory_order_acquire) && inflight < AOF_IO_DEPTH) {
+            aof_write_req_t *req = aof_find_free_req(reqs);
+            if (!req) break;
+
+            int fill = aof_fill_batch(ring, req, &local_read_idx);
+            if (fill < 0) break;
+            if (fill == 0) break;
+
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&g_uring);
+            if (!sqe) {
+                int ret = io_uring_submit(&g_uring);
+                if (ret < 0) {
+                    fprintf(stderr, "AOF io_uring_submit on SQ full failed: %s\n", strerror(-ret));
+                    atomic_store(&ring->io_error, 1);
+                    break;
+                }
+                sqe = io_uring_get_sqe(&g_uring);
+            }
+            if (!sqe) break;
+
+            req->file_off = g_aof_offset;
+            g_aof_offset += (off_t)req->len;
+            req->in_use = 1;
+
+            io_uring_prep_write(sqe, g_aof_fd, req->buf, req->len, req->file_off);
+            sqe->user_data = (uint64_t)(uintptr_t)req;
+
+            inflight++;
+            submitted_now++;
         }
 
-        if (write_idx == local_read_idx) {
-            usleep(100);
+        if (submitted_now > 0) {
+            int ret = io_uring_submit(&g_uring);
+            if (ret < 0) {
+                fprintf(stderr, "AOF io_uring_submit failed: %s\n", strerror(-ret));
+                atomic_store(&ring->io_error, 1);
+                for (int i = 0; i < AOF_IO_DEPTH; i++) reqs[i].in_use = 0;
+                inflight = 0;
+                ring->stop = 1;
+            }
+            atomic_store_explicit(&ring->read_idx, local_read_idx, memory_order_release);
             continue;
         }
 
-        // ----------- 拼接 batch -----------
-        batch_len = 0;
-
-        while (local_read_idx < write_idx) {
-            size_t idx = local_read_idx % ring->capacity;
-            char *data = ring->slots[idx];
-            size_t len = ring->lens[idx];
-
-            if (!data) {
-                local_read_idx++;
-                continue;
-            }
-
-            // 放不下就先提交
-            if (batch_len + len > AOF_BATCH_BUF) {
-                break;
-            }
-
-            memcpy(batch_buf + batch_len, data, len);
-            batch_len += len;
-
-            kvs_free(data);
-            ring->slots[idx] = NULL;
-
-            local_read_idx++;
-        }
-
-        if (batch_len == 0) continue;
-
-        // ----------- 对齐（为 O_DIRECT 准备）-----------
-        // size_t aligned_len = (batch_len + 4095) & ~4095;
-        // if (aligned_len > batch_len) {
-        //     memset(batch_buf + batch_len, 0, aligned_len - batch_len);
-        // }
-
-        // ----------- 提交一次 write -----------
-        struct io_uring_sqe *sqe = io_uring_get_sqe(ring_uring);
-
-        if (sqe) {
-            // off_t offset = __sync_fetch_and_add(&g_aof_offset, aligned_len);
-
-            off_t offset = __sync_fetch_and_add(&g_aof_offset, batch_len);
-            io_uring_prep_write(sqe, g_aof_fd, batch_buf, batch_len, offset);   
-            io_uring_submit_and_wait(ring_uring, 1);
-
-            // 回收 CQE
-            struct io_uring_cqe *cqe;
-            if (io_uring_peek_cqe(ring_uring, &cqe) == 0) {
-                if (cqe->res < 0) {
-                    fprintf(stderr, "AOF write error: %d\n", cqe->res);
-                }
-                io_uring_cqe_seen(ring_uring, cqe);
-            }
+        if (inflight > 0) {
+            aof_reap_completions(&g_uring, reqs, &inflight, 1);
         } else {
-            // fallback（极少发生）
-            // off_t offset = __sync_fetch_and_add(&g_aof_offset, aligned_len);
-            // ssize_t n = pwrite(g_aof_fd, batch_buf, aligned_len, offset);
-            // (void)n;
+            usleep(AOF_IDLE_US);
         }
-
-        // 更新读指针
-        atomic_store(&ring->read_idx, local_read_idx);
     }
 
-    free(batch_buf);
+    for (int i = 0; i < AOF_IO_DEPTH; i++) free(reqs[i].buf);
     return NULL;
 }
-// ---------- AOF 加载（mmap）----------
+
+// ---------- AOF ----------
 static int aof_load_file(void) {
     FILE *fp = fopen(AOF_FILE, "rb");
     if (!fp) return 0;
 
-    fseek(fp, 0, SEEK_END);
-    long file_size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    int fd = fileno(fp);
-    char *map = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (map == MAP_FAILED) {
+    if (fseek(fp, 0, SEEK_END) != 0) {
         fclose(fp);
         return -1;
     }
 
+    long file_size = ftell(fp);
+    if (file_size <= 0) {
+        fclose(fp);
+        return 0;
+    }
+    rewind(fp);
+
+    char *buf = (char *)malloc((size_t)file_size);
+    if (!buf) {
+        fclose(fp);
+        return -1;
+    }
+
+    size_t nread = fread(buf, 1, (size_t)file_size, fp);
+    fclose(fp);
+    if (nread != (size_t)file_size) {
+        free(buf);
+        return -1;
+    }
+
     loading_aof = 1;
-    char *ptr = map;
-    char *end = map + file_size;
+    char *ptr = buf;
+    char *end = buf + file_size;
     char *resp = NULL;
 
     while (ptr < end) {
@@ -583,67 +776,94 @@ static int aof_load_file(void) {
     }
 
     loading_aof = 0;
-    munmap(map, file_size);
-    fclose(fp);
+    free(buf);
     return 0;
 }
 
-// ---------- 公共 API ----------
-
-
+// ---------- API ----------
 int kvs_persistence_init(void) {
     mkdir("./Persistence", 0755);
-    if (!g_config.appendonly) return 0;//是否开启aof
+    if (!g_config.appendonly) return 0;
 
-    // persistence_mode = 2;
-    int mode = g_config.appendfsync;  // 0=no, 2=always
-
-    // 初始化环形缓冲区
+    int mode = g_config.appendfsync;
     aof_ring_t *ring = &g_aof_ring;
-    ring->capacity = AOF_RING_CAPACITY;//65536
+
+    ring->capacity = AOF_RING_CAPACITY;
     ring->slots = (char **)kvs_malloc(sizeof(char *) * ring->capacity);
     ring->lens = (size_t *)kvs_malloc(sizeof(size_t) * ring->capacity);
     if (!ring->slots || !ring->lens) {
         fprintf(stderr, "Failed to allocate AOF ring buffer\n");
+        if (ring->slots) kvs_free(ring->slots);
+        if (ring->lens) kvs_free(ring->lens);
+        ring->slots = NULL;
+        ring->lens = NULL;
         return -1;
     }
+
     memset(ring->slots, 0, sizeof(char *) * ring->capacity);
     memset(ring->lens, 0, sizeof(size_t) * ring->capacity);
-    atomic_init(&ring->write_idx, 0);//声明为原子变量
+    atomic_init(&ring->write_idx, 0);
     atomic_init(&ring->read_idx, 0);
-
-    ring->stop = 0;//stop=1代表需要停止了
+    atomic_init(&ring->io_error, 0);
+    ring->stop = 0;
     ring->sync_mode = mode;
 
-    if (mode == 2) {
-        // always 模式：创建后台线程，不使用 io_uring
+    if (mode == 2) {//fwrite
         if (pthread_create(&ring->thread, NULL, aof_worker, NULL) != 0) {
             perror("pthread_create always");
             return -1;
         }
-    } else {
-        // no 模式：初始化 io_uring + 后台线程
-        struct io_uring_params params = {0};
-        params.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF;
-        params.sq_thread_idle = 1000;  // 空闲 1ms 后睡眠，可调低如 100
-        int ret = io_uring_queue_init_params(MAX_BATCH * 4, &g_uring, &params);
+        return 0;
+    }
 
-        if (ret < 0) { perror("io_uring_queue_init_params"); return -1; }
+    struct io_uring_params params = {0};
+    params.flags = IORING_SETUP_SQPOLL;
+    params.sq_thread_idle = AOF_SQPOLL_IDLE_MS;
 
-        g_aof_fd = open(AOF_FILE, O_WRONLY | O_CREAT  , 0644);
-        if (g_aof_fd < 0) {
-            io_uring_queue_exit(&g_uring);
-            return -1;
-        }
-
-        
-        g_aof_offset = lseek(g_aof_fd, 0, SEEK_END);
-
-        if (pthread_create(&ring->thread, NULL, aof_worker, NULL) != 0) {
-            perror("pthread_create no");
+    int ret = io_uring_queue_init_params(AOF_URING_ENTRIES, &g_uring, &params);
+    if (ret < 0) {
+        fprintf(stderr, "AOF SQPOLL init failed: %s, fallback to normal io_uring\n", strerror(-ret));
+        memset(&params, 0, sizeof(params));
+        ret = io_uring_queue_init_params(AOF_URING_ENTRIES, &g_uring, &params);
+        if (ret < 0) {
+            fprintf(stderr, "AOF io_uring init failed: %s\n", strerror(-ret));
             return -1;
         }
     }
+
+    g_uring_enabled = 1;
+
+    printf("AOF io_uring initialized: entries=%d, depth=%d, batch=%d, sqpoll=%s\n",
+           AOF_URING_ENTRIES,
+           AOF_IO_DEPTH,
+           AOF_BATCH_BUF,
+           (params.flags & IORING_SETUP_SQPOLL) ? "on" : "off");
+
+    g_aof_fd = open(AOF_FILE, O_WRONLY | O_CREAT, 0644);
+    if (g_aof_fd < 0) {
+        io_uring_queue_exit(&g_uring);
+        g_uring_enabled = 0;
+        return -1;
+    }
+
+    g_aof_offset = lseek(g_aof_fd, 0, SEEK_END);
+    if (g_aof_offset < 0) {
+        close(g_aof_fd);
+        g_aof_fd = -1;
+        io_uring_queue_exit(&g_uring);
+        g_uring_enabled = 0;
+        return -1;
+    }
+
+    if (pthread_create(&ring->thread, NULL, aof_worker, NULL) != 0) {
+        perror("pthread_create no");
+        close(g_aof_fd);
+        g_aof_fd = -1;
+        io_uring_queue_exit(&g_uring);
+        g_uring_enabled = 0;
+        return -1;
+    }
+
     return 0;
 }
 
@@ -651,63 +871,65 @@ void kvs_persistence_close(void) {
     aof_ring_t *ring = &g_aof_ring;
     if (!g_config.appendonly) return;
 
-    // 通知工作线程停止
     ring->stop = 1;
-    // 唤醒可能阻塞在 sem_wait 的线程
     pthread_join(ring->thread, NULL);
 
-    // 清理环形缓冲区
     for (size_t i = 0; i < ring->capacity; i++) {
         if (ring->slots[i]) {
             kvs_free(ring->slots[i]);
+            ring->slots[i] = NULL;
         }
     }
     kvs_free(ring->slots);
     kvs_free(ring->lens);
+    ring->slots = NULL;
+    ring->lens = NULL;
 
-
-    if (aof_fp) fclose(aof_fp);
-    if (g_aof_fd >= 0) close(g_aof_fd);
-    io_uring_queue_exit(&g_uring);
+    if (aof_fp) {
+        fclose(aof_fp);
+        aof_fp = NULL;
+    }
+    if (g_aof_fd >= 0) {
+        fsync(g_aof_fd);
+        close(g_aof_fd);
+        g_aof_fd = -1;
+    }
+    if (g_uring_enabled) {
+        io_uring_queue_exit(&g_uring);
+        g_uring_enabled = 0;
+    }
 }
-
-
 
 int kvs_persistence_append(const char *cmd, int len) {
     if (loading_aof || !g_config.appendonly) return 0;
+    if (!cmd || len <= 0) return -1;
 
     aof_ring_t *ring = &g_aof_ring;
+    if (atomic_load(&ring->io_error)) return -1;
 
-    size_t write_idx = atomic_load(&ring->write_idx);
-    size_t read_idx = atomic_load(&ring->read_idx);
-    // 环形缓冲区满则降级同步写（不阻塞业务）
-    if (write_idx - read_idx >= ring->capacity) {
-        printf("降级\n");
-        if (ring->sync_mode == 0) {
-            ssize_t n = pwrite(g_aof_fd, cmd, len,
-                               __sync_fetch_and_add(&g_aof_offset, len));
-            (void)n;
-        } else {
-            fwrite(cmd, 1, len, aof_fp);
-            fflush(aof_fp);
-            fsync(fileno(aof_fp));
-        }
-        return 0;
-    }
-
-    // 分配内存并拷贝命令
-    char *data = (char *)kvs_malloc(len);
+    char *data = (char *)kvs_malloc((size_t)len);
     if (!data) return -1;
-    memcpy(data, cmd, len);
+    memcpy(data, cmd, (size_t)len);
+
+    size_t write_idx = atomic_load_explicit(&ring->write_idx, memory_order_relaxed);
+    size_t read_idx = atomic_load_explicit(&ring->read_idx, memory_order_acquire);
+
+    while (write_idx - read_idx >= ring->capacity) {
+        usleep(AOF_IDLE_US);
+        if (atomic_load(&ring->io_error)) {
+            kvs_free(data);
+            return -1;
+        }
+        read_idx = atomic_load_explicit(&ring->read_idx, memory_order_acquire);
+    }
 
     size_t idx = write_idx % ring->capacity;
     ring->slots[idx] = data;
-    ring->lens[idx] = len;
+    ring->lens[idx] = (size_t)len;
+    atomic_store_explicit(&ring->write_idx, write_idx + 1, memory_order_release);
 
-    atomic_store(&ring->write_idx, write_idx + 1);
     return 0;
 }
-
 int kvs_persistence_bgsave(void) {
     pid_t pid = fork();
     if (pid < 0) {

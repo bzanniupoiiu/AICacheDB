@@ -5,6 +5,8 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
+const volatile __u16 target_port = 8888;
+
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 24);
@@ -43,7 +45,7 @@ int xdp_filter(struct xdp_md *ctx)
     if (!bounds_ok(tcp, data_end, sizeof(*tcp)))
         return XDP_PASS;
 
-    if (tcp->dest != bpf_htons(8888))
+    if (target_port != 0 && tcp->dest != bpf_htons(target_port))
         return XDP_PASS;
 
     int tcp_len = tcp->doff * 4;
@@ -70,6 +72,7 @@ int xdp_filter(struct xdp_md *ctx)
     e->daddr = ip->daddr;
     e->sport = tcp->source;
     e->dport = tcp->dest;
+    e->seq = bpf_ntohl(tcp->seq);
     e->full_len = full_len;
     e->payload_len = copy_len;
 

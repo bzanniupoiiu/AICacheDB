@@ -10,7 +10,8 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <stddef.h>
-#include <netinet/in.h>   
+#include <stdint.h>
+#include <netinet/in.h>
 #include <sys/socket.h>  
 #include <pthread.h>
 #include <sys/time.h>
@@ -183,6 +184,11 @@ rbtree_node *rbtree_delete(rbtree *T, rbtree_node *z);
 
 #if ENABLE_VECTOR
 
+#define KVS_HNSW_MAX_LEVEL 8
+#define KVS_HNSW_M 8
+#define KVS_HNSW_EF_CONSTRUCTION 32
+#define KVS_HNSW_EF_SEARCH 64
+
 typedef struct vectory_entry
 {
 	char *question;
@@ -191,11 +197,22 @@ typedef struct vectory_entry
 	int dim;
 	float norm;
 	long long ctime;
+	int hnsw_id;
+	int hnsw_level;
+	int hnsw_deleted;
+	int *hnsw_neighbors[KVS_HNSW_MAX_LEVEL];
+	int hnsw_neighbor_count[KVS_HNSW_MAX_LEVEL];
 }vector_entry_t;
 
 typedef struct kvs_vector
 {
 	kvs_rbtree_t tree;
+	vector_entry_t **items;
+	int item_cap;
+	int next_id;
+	int entry_point;
+	int max_level;
+	unsigned int rand_seed;
 	int count;
 }kvs_vector_t;
 
@@ -207,6 +224,13 @@ typedef struct vector_get_result
 
 }vector_get_result_t;
 
+typedef struct vector_search_result
+{
+	char *question;
+	char *answer;
+	float score;
+}vector_search_result_t;
+
 int kvs_vector_create(kvs_vector_t *inst);
 void kvs_vector_destroy(kvs_vector_t *inst);
 
@@ -214,6 +238,8 @@ int kvs_vector_set(kvs_vector_t *inst, char *question, char *answer, int dim, ch
 vector_entry_t *kvs_vector_get_by_key(kvs_vector_t *inst, char *question);
 
 int kvs_vector_get_by_vector(kvs_vector_t *inst, int dim, char *vector_str, float threshold, vector_get_result_t *result);
+int kvs_vector_search(kvs_vector_t *inst, int dim, char *vector_str, int topk, float threshold, vector_search_result_t **results, int *out_count);
+void kvs_vector_search_results_free(vector_search_result_t *results);
 #endif
 // _______________________持久化————————————————————————————————
 
@@ -237,6 +263,7 @@ int kvs_persistence_get_eventfd(void);
 void kvs_persistence_process_completions(void) ;
 
 int rdb_load_files(void);
+int kvs_reset_data_engines(void);
 
 
 // _______________________内存池————————————————————————————————
@@ -287,6 +314,10 @@ typedef struct kvs_replica_s {
     int rdb_fd;                 // RDB 文件描述符
     off_t rdb_size;             // 文件总大小
     off_t rdb_offset;           // 已发送偏移
+    char *rdb_buf;              // RDMA write 模式下的全量内存快照
+    struct ibv_mr *rdb_mr;      // rdb_buf 注册后的本地 MR
+    uint64_t rdb_seq;           // 全量同步分片序号
+    char rdb_tmp_file[256];     // 兼容旧清理逻辑，当前主路径使用内存快照
 } kvs_replica_t;
 
 // 主节点全局从链表
@@ -306,10 +337,11 @@ int kvs_replication_slave_start(const char *master_host, int master_port, int rd
 void kvs_replication_slave_cleanup(void);
 
 // 全局标志
-extern int replicating;   // 从节点是否正在从主节点接收命令（避免循环）
+extern __thread int replicating;   // 从节点线程正在应用主节点命令时置 1，用于绕过只读检查
 // extern int bgsave_running; // 主节点是否正在 BGSAVE
 // extern pid_t bgsave_pid;
 int rdb_save_to_file(const char *filename);   // 保存 RDB 到指定文件
+int rdb_save_to_memory(char **out_buf, size_t *out_len);
 
 
 

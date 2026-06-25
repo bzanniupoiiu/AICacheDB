@@ -44,6 +44,7 @@ $(Target): prepare $(NTYCO_LIB)
 	$(CC) -o ./test/test_aof_rdb_replicaof_qps ./test/test_aof_rdb_replicaof_qps.c
 	$(CC) -o ./test/test_expire ./test/test_expire.c
 	$(CC) -o ./test/test_rdb_qps ./test/test_rdb_qps.c
+	$(CC) -I. -o ./test/test_rdma_protocol ./test/test_rdma_protocol.c -libverbs -lrdmacm -lpthread
 	
 
 # 清理
@@ -51,7 +52,7 @@ clean:
 	rm -rf $(Target)
 	rm -rf ./kvs-client/kvstore_client
 	rm -rf ./Persistence/slave/kvstore
-	rm -rf ./test/test_engine ./test/test_persistence ./test/test_mempool ./test/test_mutil_cmd ./test/test_hiredis ./test/test_aof_rdb_replicaof_qps ./test/test_bigkey_spchar ./test/test_expire ./test/test_rdb_qps
+	rm -rf ./test/test_engine ./test/test_persistence ./test/test_mempool ./test/test_mutil_cmd ./test/test_hiredis ./test/test_aof_rdb_replicaof_qps ./test/test_bigkey_spchar ./test/test_expire ./test/test_rdb_qps ./test/test_rdma_protocol
 	rm -rf ./Persistence/kvstore.aof
 	rm -rf ./Persistence/kvstore.rdb
 	rm -rf ./Persistence/slave/Persistence/kvstore.aof

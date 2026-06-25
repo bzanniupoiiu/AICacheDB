@@ -36,31 +36,60 @@ int epfd = 0;
 
 struct conn conn_list[CONNECTION_SIZE] = {0};
 
+static int conn_fd_valid(int fd) {
+    return fd >= 0 && fd < CONNECTION_SIZE;
+}
+
+static void close_conn(int fd) {
+    if (!conn_fd_valid(fd)) {
+        if (fd >= 0) close(fd);
+        return;
+    }
+
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+
+    if (conn_list[fd].rbuffer) {
+        kvs_free(conn_list[fd].rbuffer);
+    }
+    if (conn_list[fd].wbuffer) {
+        kvs_free(conn_list[fd].wbuffer);
+    }
+
+    memset(&conn_list[fd], 0, sizeof(conn_list[fd]));
+    close(fd);
+}
+
 
 int set_event(int fd, int event, int flag) {
+    if (!conn_fd_valid(fd)) {
+        return -1;
+    }
 
 	if (flag) {  // non-zero add
 
 		struct epoll_event ev;
 		ev.events = event;
 		ev.data.fd = fd;
-		epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+		return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
 
 	} else {  // zero mod
 
 		struct epoll_event ev;
 		ev.events = event;
 		ev.data.fd = fd;
-		epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
-		
+		return epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+
 	}
-	
 
 }
 
 
 int event_register(int fd, int event) {
-    if (fd < 0) return -1;
+    if (!conn_fd_valid(fd)) {
+        fprintf(stderr, "fd out of range: %d\n", fd);
+        if (fd >= 0) close(fd);
+        return -1;
+    }
     struct conn *c = &conn_list[fd];
     c->fd = fd;
     c->r_action.recv_callback = recv_cb;
@@ -76,7 +105,10 @@ int event_register(int fd, int event) {
     c->wlength = 0;
     c->woffset = 0;
 
-    set_event(fd, event, 1);
+    if (set_event(fd, event, 1) != 0) {
+        close_conn(fd);
+        return -1;
+    }
     return 0;
 }
 
@@ -92,13 +124,18 @@ int accept_cb(int fd) {
 		printf("accept errno: %d --> %s\n", errno, strerror(errno));
 		return -1;
 	}
-	event_register(clientfd, EPOLLIN);  // | EPOLLET
+	if (event_register(clientfd, EPOLLIN) != 0) {
+		return -1;
+	}
 
 	return 0;
 }
 
 // 修改 send_cb 函数
 int send_cb(int fd) {
+    if (!conn_fd_valid(fd)) {
+        return -1;
+    }
     struct conn *c = &conn_list[fd];
     
     if (c->wlength == 0) {
@@ -113,7 +150,7 @@ int send_cb(int fd) {
             return 0;
         }
         perror("send");
-        close(fd);
+        close_conn(fd);
         return -1;
     }
     
@@ -132,6 +169,9 @@ int send_cb(int fd) {
 
 // 修改 recv_cb，在末尾立即发送并添加调试
 int recv_cb(int fd) {
+    if (!conn_fd_valid(fd)) {
+        return -1;
+    }
     struct conn *c = &conn_list[fd];
 
     // 确保接收缓冲区有空间（原代码不变）
@@ -139,7 +179,7 @@ int recv_cb(int fd) {
         printf("kuorong!!~\n");
         size_t new_size = c->rbuf_size * 2;
         char *new_buf = (char*)kvs_malloc(new_size);
-        if (!new_buf) { close(fd); return -1; }
+        if (!new_buf) { close_conn(fd); return -1; }
         // 拷贝旧数据
         memcpy(new_buf, c->rbuffer, c->rlength);
         // 释放旧缓冲区
@@ -151,9 +191,7 @@ int recv_cb(int fd) {
     int n = recv(fd, c->rbuffer + c->rlength, c->rbuf_size - c->rlength - 1, 0);
     if (n <= 0) {
         // if (n == 0) printf("[recv_cb] connection closed\n");
-        kvs_free(c->rbuffer); kvs_free(c->wbuffer);
-        close(fd);
-        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+        close_conn(fd);
         return -1;
     }
     c->rlength += n;
@@ -174,7 +212,7 @@ int recv_cb(int fd) {
                     size_t new_size = c->wbuf_size * 2;
                     if (new_size < c->wlength + resp_len) new_size = c->wlength + resp_len;
                     char *new_wbuf = (char*)kvs_malloc(new_size);
-                    if (!new_wbuf) { kvs_free(resp_buf); close(fd); return -1; }
+                    if (!new_wbuf) { kvs_free(resp_buf); close_conn(fd); return -1; }
                     // 拷贝旧数据
                     memcpy(new_wbuf, c->wbuffer, c->wlength);
                     // 释放旧缓冲区
@@ -186,7 +224,7 @@ int recv_cb(int fd) {
                 c->wlength += resp_len;
                 kvs_free(resp_buf);
             } else if (resp_len < 0) {
-                close(fd); return -1;
+                close_conn(fd); return -1;
             }
             c->rparse_offset += cmd_len;
         } else if (ret == 0) {
@@ -238,10 +276,16 @@ int r_init_server(unsigned short port) {
 int reactor_start(unsigned short port) {
     epfd = epoll_create(1);
     int sockfd = r_init_server(port);
-    if (sockfd < 0) return -1;
+    if (!conn_fd_valid(sockfd)) {
+        if (sockfd >= 0) close(sockfd);
+        return -1;
+    }
     conn_list[sockfd].fd = sockfd;
     conn_list[sockfd].r_action.recv_callback = accept_cb;
-    set_event(sockfd, EPOLLIN, 1);
+    if (set_event(sockfd, EPOLLIN, 1) != 0) {
+        close(sockfd);
+        return -1;
+    }
 
 
    
@@ -253,11 +297,18 @@ int reactor_start(unsigned short port) {
 
         for (int i = 0; i < nready; i++) {
             int fd = events[i].data.fd;
+            if (!conn_fd_valid(fd)) {
+                continue;
+            }
             if (events[i].events & EPOLLIN) {
-                conn_list[fd].r_action.recv_callback(fd);
+                if (conn_list[fd].r_action.recv_callback) {
+                    conn_list[fd].r_action.recv_callback(fd);
+                }
             }
             if (events[i].events & EPOLLOUT) {
-                conn_list[fd].send_callback(fd);
+                if (conn_list[fd].send_callback) {
+                    conn_list[fd].send_callback(fd);
+                }
             }
             
         }

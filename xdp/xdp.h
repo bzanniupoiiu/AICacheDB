@@ -8,13 +8,14 @@
  * 普通以太网 MTU 下 4096 足够。
  * 如果你的环境是 loopback/GSO，大包可能更大，可以改成 8192 或 16384。
  */
-#define MAX_DATA 4096
+#define MAX_DATA 16384
 
 struct event {
     __u32 saddr;
     __u32 daddr;
     __u16 sport;
     __u16 dport;
+    __u32 seq;
 
     /*
      * full_len 是当前 TCP payload 的原始长度；

@@ -1,0 +1,8 @@
+/bin/
+/data/
+*.o
+__pycache__/
+*.pyc
+.env
+*.local.conf
+/backups/

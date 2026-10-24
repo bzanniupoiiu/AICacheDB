@@ -1,0 +1,26 @@
+name: Daily runtime
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        mode: [release, sanitize]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: |
+          if [ "${{ matrix.mode }}" = sanitize ]; then
+            make sanitize
+          else
+            make test
+          fi
+  container:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t aicachedb:test .
+      - name: Verify container and restart recovery
+        run: python3 tests/docker_smoke.py --image aicachedb:test

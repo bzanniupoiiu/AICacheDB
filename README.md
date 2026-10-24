@@ -1,248 +1,100 @@
+# AICacheDB
 
----
+**轻量、本地优先的键值与向量缓存。保存数据、找回相似答案，在浏览器里完成日常操作。**
 
-# KVStore 高性能键值存储系统
+0.3 日常版以小规模单机使用为目标：普通 Linux / WSL、C 编译器和 make 即可构建；Python 3.9+ 提供无第三方依赖的客户端与工作台。原来的 epoll / NtyCo / io_uring、RDMA/XDP 与 HNSW 研究实现仍保留在实验构建中。
 
-KVStore 是一个**基于 C 语言实现的高性能键值存储系统**，支持多种网络模型、存储引擎、持久化机制与主从复制，兼容 **Redis RESP 协议**，可直接使用 `redis-cli` 访问。
+![AICacheDB 浏览器工作台](docs/console-desktop.png)
 
----
+## 三分钟开始
 
-## 项目特性
+Linux / WSL 上安装 GCC、make、Python 3，然后：
 
-* **网络模型**：EPOLL Reactor / NtyCo 协程 / io_uring
-* **存储引擎**：Array / RBTree / Hash / SkipList
-* **协议兼容**：Redis RESP
-* **持久化**：RDB + AOF
-* **功能特性**：主从复制 / Pipeline / 过期时间
-* **数据支持**：大 Key / Binary Value
-* **内存优化**：不定长内存池
-
----
-
-## 编译与运行
-
-### 环境依赖
-
-| 组件    | 要求                 |
-| ----- | ------------------ |
-| Linux | ≥ 5.1（支持 io_uring） |
-| GCC   | C11                |
-| make  | 构建工具               |
-| NtyCo | 已内置                |
-
-### 获取与编译
-
-```bash
-git clone http://gitlab.0voice.com/raoyipeng24/9.1-kvstore.git --recursive
-cd 9.1-kvstore
-make clean && make
+```sh
+git clone --branch codex/daily-use https://github.com/bzanniupoiiu/AICacheDB.git
+cd AICacheDB
+python3 tools/start.py
 ```
 
-### 运行
+打开终端打印的 `http://127.0.0.1:8099/#...` 链接，即可保存键值、浏览记录、写入向量、搜索相似答案、整理日志和生成备份。链接中包含本次控制台的访问 token，请保留给自己。Ctrl+C 同时停止数据库与工作台。默认 127.0.0.1:8888、64 MiB 数据预算、128 连接，数据保存在 `./data`。
 
-```bash
-./bin/kvstore -c kvstore.conf
+只运行数据库：
+
+```sh
+make
+./bin/kvstore -c config.example.conf
 ```
 
-客户端：
+另一终端验证：
 
-```bash
-redis-cli -h 127.0.0.1 -p 8888
+```sh
+python3 tools/client.py PING
+python3 tools/client.py SET notes:today '今天的第一条笔记' EX 3600
+python3 tools/client.py GET notes:today
 ```
 
----
+## Windows 访问你的 Linux 主机
 
-## 网络模型
+数据库在主机运行后，在 Windows 终端保持以下隧道开启：
 
-| 模型       | 技术       | 特点        |
-| -------- | -------- | --------- |
-| Reactor  | epoll    | 成熟稳定      |
-| Proactor | io_uring | 内核异步，高性能  |
-| NtyCo    | 协程       | 同步编程，开发友好 |
-
-> Reactor 与 NtyCo 实测支持 **百万级并发连接**
-
----
-
-## 存储引擎
-
-| 引擎       | 结构   | 复杂度      | 场景   |
-| -------- | ---- | -------- | ---- |
-| Array    | 动态数组 | O(n)     | 小数据  |
-| RBTree   | 红黑树  | O(log n) | 有序   |
-| Hash     | 哈希表  | O(1)     | 高并发  |
-| SkipList | 跳表   | O(log n) | 有序集合 |
-
-### 引擎测试
-
-```bash
-./bin/kvstore -c kvstore.conf
-./test/test_engine 127.0.0.1 8888
+```powershell
+ssh -N -L 18888:127.0.0.1:8888 raoyipeng@192.168.32.129
 ```
 
-覆盖操作：SET / GET / MOD / EXIST / DEL / EXPIRE / TTL / SETEX
-总操作量：**36 万次**
-输出 `engine all tests passed!` 表示通过。
+另开终端，在本项目目录运行：
 
----
-
-## 持久化
-
-KVStore 支持 **RDB + AOF 混合持久化**。
-
-### RDB
-
-* fork 子进程生成快照（不阻塞）
-* mmap 加速加载
-
-### AOF
-
-* **always**：每次写入立即刷盘（高可靠）
-* **no**：io_uring 异步刷盘（高性能）
-
-### AOF性能对比（100w 数据）
-
-测试命令 redis-benchmark -h 127.0.0.1 -p 8888 -n 1000000 -c 200 -d 128 -t SET,GET -q
-
-| 操作 | 无持久化 | AOF(io_uring) | AOF(fwrite) |Redis| 
-|--------|---------|---------|----------|----------|
-| SET/GET| 112422/120889 | 111333/119161 |  101122/115526.80   | 108049/99980    | 
-| PING   | 175642  |  161008.09 | 158647  |  169121   |
-
-
-### BGSAVE 测试： redis-benchmark -h 127.0.0.1 -p 8888 -n 1000000 -c 100 -d 128 -t SET -q
-
-| 测试类型 | BGSAVE间隔 | 写入QPS |  
-|---------|-----------|---------|
-| 低频快照 | 每100万条 | 115821 |   
-| 中低频快照 | 每10万条 | 112485 |   
-| 中频快照 | 每1万条 | 109265 |   
-| 高频快照 | 每1千条 | 105898 |   
-
-
-
-### RDB 加载
-
-| 模式   | 耗时         |
-| ---- | ---------- |
-| read | 0.577s     |
-| mmap | **0.199s** |
-
----
-
-## 内存池
-
-不定长内存池：
-
-* 小对象走 block，大对象独立分配
-* 减少 malloc/free
-* 降低碎片
-
-默认 block：**256MB**
-
-> 高并发下内存更稳定，QPS 更高（优于 malloc / jemalloc）
-
----
-
-# 主从复制
-
-支持**RDMA 全量同步 + eBPF/XDP 增量转发**，目标是让主节点负责写入，从节点承担读请求和语义缓存查询。
-
-## 全量同步选型
-
-全量同步采用 RDB 内存快照作为传输对象。项目中实现并对比了 `sendfile` 与 `RDMA Write` 两种方案：
-
-1. `sendfile`：实现简单，适合普通 TCP 文件传输，但数据仍经过内核网络栈与 Socket 语义。
-2. `RDMA Write`：主节点将用户态内存直接写入从节点预注册内存，再由从节点校验并加载到存储引擎，更适合大快照、低 CPU 拷贝和未来物理 RDMA 网卡部署。
-
-测试环境：两台虚拟机 `192.168.32.139 -> 192.168.32.132`，同一虚拟化网络，`iperf3` 作为网络上限参考。RDMA 使用 Soft-iWARP (`siw0`) 验证协议与数据面，不等同于物理 RDMA 网卡。
-
-| 场景 | 测试对象 | 数据量 | 结果 |
-| ---- | ---- | ---- | ---- |
-| MTU 9000 | sendfile | 1 GB | **300.24 MB/s** |
-| MTU 9000 | 优化后 RDMA Write | 1 GB | **339.73 MB/s** |
-
-
-
-## 增量同步选型
-
-全量同步期间，写命令先进入增量环形队列；全量同步完成后，再按顺序转发积压命令并进入实时增量同步。
-
-增量同步对比了两种方案：
-
-1. 普通 TCP 代理转发：请求进入用户态代理后，同时写主节点和从节点，逻辑直观，但复制在主请求链路上，会拉高响应延迟。
-2. eBPF/XDP 转发：在主机网络入口捕获写命令，旁路转发到从节点，主请求仍由 KVStore 正常处理，复制链路与主写路径解耦。
-
-测试命令：`redis-benchmark -h 192.168.32.139 -p <port> -n 10000 -c 20 -d 128 -r 1000000 -t set -q`
-
-| 方案 | SET QPS | p50 延迟 | 说明 |
-| ---- | ---- | ---- | ---- |
-| 关闭同步 | **528.32** | **35.487 ms** | 主节点直接写入 |
-| 普通 TCP 代理双写 | 405.64 | 40.415 ms | 复制进入请求链路 |
-| eBPF/XDP 旁路转发 | 450.29 | 39.695 ms | 虚拟机环境存在 XDP/用户态转发线程调度开销 |
-
-
-### 性能影响
-
-redis-benchmark -h 127.0.0.1 -p 8888 -n 1000000 -c 200 -d 128 -t SET -q
-
-| 操作   | 关闭同步  | 开启同步  | Redis |
-| ---- | ----- | ----- |------|
-| SET  | 59923 | 57316 | 63019 |
-
-开启主从复制后，SET QPS 从 59923 降至 57316，同步链路额外开销约 **4.3%**。
-
----
-
-## Pipeline 性能
-
-## Pipeline 性能
-
-测试条件：1,000,000 次 SET 命令，不同批量大小（Pipeline），使用 `redis-benchmark -h 127.0.0.1 -p 8888 -n 1000000 -c 200 -d 128 -t SET -q -P <batch>` 测试。
-
-| Batch Size | Redis QPS | KVStore QPS | QPS 比值 (KVStore/Redis) | Redis p50 (ms) | KVStore p50 (ms) | 延迟优势 |
-|-----------|-----------|-------------|---------------------------|----------------|------------------|-----------|
-| 10         | 821,693   | 851,789     | 1.037x (+3.7%)            | 1.727          | 1.207            | KVStore 低 0.520 ms |
-| 20         | 1,053,741 | 1,658,375   | **1.574x (+57.4%)**       | 3.135          | 1.255            | KVStore 低 1.880 ms |
-| 40         | 1,336,898 | 2,352,941   | **1.760x (+76.0%)**       | 5.295          | 2.695            | KVStore 低 2.600 ms |
-| 80         | 1,414,427 | 2,369,668   | **1.675x (+67.5%)**       | 10.343         | 4.543            | KVStore 低 5.800 ms |
-| 160        | 1,385,042 | 2,680,965   | **1.936x (+93.6%)**       | 12.887         | 9.519            | KVStore 低 3.368 ms |
-
-
-
----
-
-# 大 Key / 二进制支持
-
-基于 RESP 长度前缀：
-
-```
-$len
-data
+```powershell
+python tools/console.py --port 18888
 ```
 
-支持：
+打开打印的本机链接。其他使用者替换 SSH 用户和地址即可。数据库与工作台都不需要直接暴露到公网；从机关闭不影响单机使用。
 
-* 二进制数据
-* 空格 / 换行
-* 超大 Key / Value
+## 接入 Python 应用
 
-仅受**内存限制**
+```python
+from tools.client import Client
 
----
+with Client() as db:
+    db.set("notes:today", "你好，AICacheDB", ttl=3600)
+    print(db.get("notes:today"))
 
-# 过期机制
+    # 演示向量。实际应用需使用同一 embedding 模型生成文档和查询向量。
+    db.vset("demo:v1:refund", "签收后 7 天内可申请退款。", [1, 0, 0], ttl=3600)
+    hits = db.search([0.98, 0.02, 0], topk=3, threshold=0.8, prefix="demo:v1:")
+    print(hits)
+```
 
-* 惰性删除 + 定期扫描
-* 自动同步 AOF 与从节点
+二进制数据使用 `Client(decode=False)`，键值可包含 NUL 或换行。密码从环境读取时显式传入 `password=os.environ.get("AICACHEDB_PASSWORD")`；命令行和控制台会自动读取该变量。客户端不自动重试写入，也不要跨线程共用同一个连接。
 
----
+也可以使用 `redis-cli -h 127.0.0.1 -p 8888` 发送支持的命令。协议与 Redis 部分兼容，**不是 Redis 的完整替代品**。[查看命令列表与限制](docs/commands.md)。
 
+## 这版解决了什么
 
+- **安装更轻**：默认运行不依赖 liburing、RDMA、jemalloc、NtyCo 或内核扩展。
+- **保存有明确保证**：成功回复前日志已完成 fdatasync；记录包含校验和，损坏文件拒绝启动；绝对 TTL 在重启后继续生效。
+- **内存更可控**：连接缓冲按需增长，数据设置容量上限；向量覆盖会释放旧对象，不积累墓碑。
+- **使用更直接**：浏览器工作台、中文操作提示、Python 客户端、命令行、启动器、配置示例、Docker 和 systemd 示例。
+- **检索可验证**：精确余弦相似度、稳定排序、维度校验、前缀过滤，支持更新、删除和过期。
+- **维护有入口**：INFO、SCAN、一致备份、原子日志整理；构建清理不再删除用户数据。
 
----
+## 边界
 
-**版本**：v2.1
-**更新时间**：2026-06-24
+这是允许回源重建的缓存，适合个人与小团队使用。精确向量查询复杂度为 O(N×维度)，默认从 1 万条以内的数据集评估，实际容量和延迟需按你的机器测试。为了清晰的可靠性，每次写入同步落盘，写吞吐可能低于原来异步模式的跑分。
 
----
+没有自动调用 embedding 模型、自动主从切换、集群分片、用户级 ACL 或租户权限隔离。PREFIX 只能区分逻辑集合。单机故障时应用要能回源；不要把这里当作订单或账户的唯一数据来源。新运行时日志格式与旧版不同，旧数据目录不会自动迁移。
+
+## 维护与开发
+
+- [配置、备份、恢复、Docker、升级与旧版本共存](docs/operations.md)
+- [全部命令、响应与容量限制](docs/commands.md)
+- [原研究版说明与历史性能数据](docs/experimental.md)
+- [本次验证记录](docs/validation.md)
+
+```sh
+make test       # 功能与故障回归
+make sanitize   # ASan + UBSan 检查，需要 Linux / GCC
+make clean      # 只删构建产物，保留数据
+make experimental  # 输出 bin/kvstore-experimental，需原来的扩展依赖
+```
+
+提交问题时请附版本、操作系统、复现步骤和脱敏后的报错。不要提交访问密码、原始问答数据、向量数据或备份。项目自身授权范围仍需维护者明确；第三方代码的许可证保留在对应目录中。

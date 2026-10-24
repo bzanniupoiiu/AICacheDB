@@ -1,0 +1,10 @@
+.git
+data
+backups
+bin
+NtyCo
+libbpf-bootstrap
+Persistence
+__pycache__
+.env
+*.local.conf

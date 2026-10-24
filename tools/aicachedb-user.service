@@ -1,0 +1,18 @@
+[Unit]
+Description=AICacheDB daily cache (user service)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/raoyipeng/aicachedb-daily
+ExecStart=/home/raoyipeng/aicachedb-daily/bin/kvstore -c /home/raoyipeng/aicachedb-daily/config.local.conf
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+NoNewPrivileges=true
+MemoryHigh=192M
+MemoryMax=256M
+UMask=0077
+
+[Install]
+WantedBy=default.target
